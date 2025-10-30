@@ -148,12 +148,34 @@ local function is_job_alive(job_id)
 end
 
 local function stop_holder(holder)
-  if not holder or not holder.job_id then return end
-  if is_job_alive(holder.job_id) then
-    -- try graceful interrupt, then stop
+  if not holder then return end
+  
+  -- Stop the job/process forcefully
+  if holder.job_id then
+    -- Try graceful interrupt first (Ctrl-C)
     pcall(vim.api.nvim_chan_send, holder.job_id, "\003")
+    
+    -- Force stop - use jobstop which sends SIGTERM/SIGKILL
+    -- Don't wait, just stop immediately and let OS handle cleanup
     pcall(vim.fn.jobstop, holder.job_id)
+    
+    -- Also try to get process info and kill if needed (more aggressive)
+    local ok, job_info = pcall(vim.fn.job_info, holder.job_id)
+    if ok and job_info and job_info.process then
+      -- If we have process info, we could kill it directly, but jobstop should be enough
+      -- For now, just ensure jobstop was called
+    end
   end
+  
+  -- Close window if valid (this also helps cleanup)
+  if holder.win_id and vim.api.nvim_win_is_valid(holder.win_id) then
+    pcall(vim.api.nvim_win_close, holder.win_id, true)
+  end
+  
+  -- Clear holder state to prevent reuse
+  holder.job_id = nil
+  holder.term_bufnr = nil
+  holder.win_id = nil
 end
 
 local function start_terminal()
@@ -180,7 +202,12 @@ local function start_terminal()
   local cmd = { cfg.cmd }
   for _, a in ipairs(cfg.args or {}) do table.insert(cmd, a) end
 
-  local job_id = vim.fn.termopen(cmd, { cwd = vim.loop.cwd() })
+  -- Use termopen with detach=false to ensure process terminates with Neovim
+  -- Also ensure we can properly stop the job
+  local job_id = vim.fn.termopen(cmd, {
+    cwd = vim.loop.cwd(),
+    detach = false,  -- Process should terminate when Neovim exits
+  })
   vim.api.nvim_buf_set_option(buf, "buflisted", false)
   vim.api.nvim_set_current_win(win)
   vim.cmd('startinsert')
@@ -249,6 +276,44 @@ local function send_text(payload)
     local bp_start = "\x1b[200~"
     local bp_end = "\x1b[201~"
     vim.api.nvim_chan_send(holder.job_id, bp_start .. payload .. bp_end)
+    
+    -- Clear any selection in the terminal buffer after sending
+    -- Neovim's terminal buffer may visually select text after bracketed paste
+    if holder.term_bufnr and vim.api.nvim_buf_is_valid(holder.term_bufnr) then
+      -- Use defer_fn with a small delay to ensure bracketed paste completes first
+      vim.defer_fn(function()
+        -- Use nvim_win_call to execute in the terminal window's context
+        if holder.win_id and vim.api.nvim_win_is_valid(holder.win_id) then
+          vim.api.nvim_win_call(holder.win_id, function()
+            -- First, exit visual mode if we're in it
+            local mode = vim.fn.mode()
+            if mode == 'v' or mode == 'V' or mode == '\22' then
+              vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+            end
+            
+            -- Get current cursor position
+            local cursor_pos = vim.api.nvim_win_get_cursor(0)
+            local line, col = cursor_pos[1], cursor_pos[2]
+            
+            -- Clear visual selection marks by setting both to cursor position
+            -- Set both marks to the exact same position to clear any selection range
+            vim.fn.setpos("'<", {holder.term_bufnr, line, col, 0})
+            vim.fn.setpos("'>", {holder.term_bufnr, line, col, 0})
+            
+            -- Also try clearing by setting marks to invalid/zero positions as fallback
+            -- This ensures the selection is definitely cleared
+            if vim.fn.getpos("'<")[2] ~= line or vim.fn.getpos("'>")[2] ~= line then
+              -- If marks are still different, force them to line 1, col 1
+              vim.fn.setpos("'<", {holder.term_bufnr, 1, 1, 0})
+              vim.fn.setpos("'>", {holder.term_bufnr, 1, 1, 0})
+            end
+            
+            -- Force a redraw to clear any lingering visual selection highlight
+            vim.cmd("redraw")
+          end)
+        end
+      end, 50)  -- 50ms delay to ensure paste completes
+    end
   else
     vim.api.nvim_chan_send(holder.job_id, payload)
   end
@@ -260,29 +325,39 @@ end
 
 function M.close()
   local holder = get_active_holder()
-  if holder and holder.job_id and is_job_alive(holder.job_id) then
-    -- Send Ctrl-C to attempt graceful exit; then close window
-    pcall(vim.api.nvim_chan_send, holder.job_id, "\003")
-    pcall(vim.fn.jobstop, holder.job_id)
-  end
-  if holder and holder.win_id and vim.api.nvim_win_is_valid(holder.win_id) then
-    pcall(vim.api.nvim_win_close, holder.win_id, true)
-  end
+  -- Use stop_holder which does complete cleanup
+  stop_holder(holder)
 end
 
 function M.shutdown()
   -- Public method to stop all managed jobs
+  -- This is called on VimLeavePre to ensure cleanup
   stop_holder(state.global)
-  for _, holder in pairs(state.per_tab) do
+  for tab_id, holder in pairs(state.per_tab) do
     stop_holder(holder)
   end
+  -- Clear all state
+  state.per_tab = {}
+  state.global = { job_id = nil, term_bufnr = nil, win_id = nil }
 end
 
 function M.send_range(start_line, end_line)
   local bufnr = vim.api.nvim_get_current_buf()
-  local l1 = math.max(0, (start_line or vim.fn.line(".") ) - 1)
-  local l2 = math.max(l1, (end_line or start_line or vim.fn.line(".") ))
-  local lines = vim.api.nvim_buf_get_lines(bufnr, l1, l2, true)
+  -- Convert 1-based inclusive to 0-based exclusive for nvim_buf_get_lines
+  -- start_line and end_line are 1-based, inclusive
+  -- nvim_buf_get_lines expects 0-based indices with exclusive end
+  local start_1based = start_line or vim.fn.line(".")
+  local end_1based = end_line or start_1based  -- Default to single line if end_line not provided
+  
+  -- Convert to 0-based: line 5 (1-based) = index 4 (0-based)
+  local l1 = math.max(0, start_1based - 1)
+  -- nvim_buf_get_lines uses exclusive end (end index is NOT included)
+  -- To include line 10 (1-based, index 9), we need end=10 (exclusive)
+  -- Example: lines 5-10 (1-based) = indices 4-9 (0-based)
+  -- nvim_buf_get_lines(bufnr, 4, 10, false) returns indices 4-9 = lines 5-10 ✓
+  local l2 = end_1based  -- Use directly as 0-based exclusive end
+  
+  local lines = vim.api.nvim_buf_get_lines(bufnr, l1, l2, false)
   if #lines == 0 then return end
   
   -- Check if buffer is modified and has a file path
@@ -291,9 +366,11 @@ function M.send_range(start_line, end_line)
   
   if not is_modified and filepath and filepath ~= "" then
     -- Use @ file reference for unmodified files
-    local start_1based = l1 + 1  -- Convert 0-based to 1-based
-    local end_1based = l2        -- Already 1-based
-    local ref = build_file_reference(filepath, start_1based, end_1based)
+    -- l1 and l2 are 0-based indices: l1 is inclusive start, l2 is exclusive end
+    -- Convert to 1-based for file reference
+    local start_1based_ref = l1 + 1  -- Convert 0-based to 1-based
+    local end_1based_ref = l2        -- l2 = end_1based (already 1-based line number)
+    local ref = build_file_reference(filepath, start_1based_ref, end_1based_ref)
     send_text(ref)
   else
     -- Fall back to copying content for modified files or buffers without paths
@@ -304,31 +381,19 @@ function M.send_range(start_line, end_line)
 end
 
 function M.send_visual()
-  -- visual selection using '< and '>
-  local bufnr = vim.api.nvim_get_current_buf()
-  local start_pos = vim.fn.getpos("'<")
-  local end_pos = vim.fn.getpos("'>")
-  local l1 = math.max(0, start_pos[2] - 1)
-  local l2 = math.max(l1, end_pos[2])
-  local lines = vim.api.nvim_buf_get_lines(bufnr, l1, l2, true)
-  if #lines == 0 then return end
+  -- visual selection using '< and '> marks
+  -- Simply get the line numbers and delegate to send_range
+  local start_line = vim.fn.line("'<")
+  local end_line = vim.fn.line("'>")
   
-  -- Check if buffer is modified and has a file path
-  local filepath = vim.api.nvim_buf_get_name(bufnr)
-  local is_modified = vim.bo[bufnr].modified
-  
-  if not is_modified and filepath and filepath ~= "" then
-    -- Use @ file reference for unmodified files
-    local start_1based = l1 + 1  -- Convert 0-based to 1-based
-    local end_1based = l2        -- Already 1-based
-    local ref = build_file_reference(filepath, start_1based, end_1based)
-    send_text(ref)
-  else
-    -- Fall back to copying content for modified files or buffers without paths
-    local ft = vim.bo[bufnr].filetype
-    local payload = build_payload(lines, ft)
-    send_text(payload)
+  -- Validate we have a valid selection
+  if start_line < 1 or end_line < 1 or start_line > end_line then
+    return
   end
+  
+  -- Use send_range which already handles ranges correctly
+  -- This ensures consistent behavior between visual selections and explicit ranges
+  M.send_range(start_line, end_line)
 end
 
 function M.send_buffer()
@@ -361,11 +426,25 @@ function M.setup(user_config)
     vim.api.nvim_create_autocmd('VimLeavePre', {
       group = aug,
       callback = function()
-        -- Stop global holder
-        stop_holder(state.global)
-        -- Stop per-tab holders
-        for _, holder in pairs(state.per_tab) do
-          stop_holder(holder)
+        -- Use shutdown method which does complete cleanup
+        M.shutdown()
+      end,
+    })
+    
+    -- Also handle BufUnload for terminal buffers to clean up when buffers are closed
+    vim.api.nvim_create_autocmd('BufUnload', {
+      group = aug,
+      callback = function(opts)
+        local bufnr = opts.buf
+        -- Check if this is one of our terminal buffers
+        if state.global.term_bufnr == bufnr then
+          stop_holder(state.global)
+        end
+        for tab_id, holder in pairs(state.per_tab) do
+          if holder.term_bufnr == bufnr then
+            stop_holder(holder)
+            state.per_tab[tab_id] = nil
+          end
         end
       end,
     })

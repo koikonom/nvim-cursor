@@ -40,11 +40,37 @@ require('cursor_agent').setup({
 
 ### Suggested keymaps
 
+**Recommended (Lua) - ensures visual selection is captured correctly:**
+
+```lua
+vim.keymap.set('n', '<leader>ca', '<cmd>CursorAgentOpen<CR>', {})
+vim.keymap.set('x', '<leader>cs', function()
+  local mod = require('cursor_agent')
+  local start_line = vim.fn.line("'<")
+  local end_line = vim.fn.line("'>")
+  if start_line > 0 and end_line > 0 and start_line <= end_line then
+    -- Call send_range directly to avoid any command parsing issues
+    mod.send_range(start_line, end_line)
+  end
+end, {})
+vim.keymap.set('n', '<leader>cb', '<cmd>CursorAgentSendBuffer<CR>', {})
+```
+
+**Alternative (Vimscript):**
+
 ```vim
 nnoremap <leader>ca :CursorAgentOpen<CR>
-xnoremap <leader>cs :<C-u>CursorAgentSend<CR>
+xnoremap <leader>cs :CursorAgentSendVisual<CR>
 nnoremap <leader>cb :CursorAgentSendBuffer<CR>
 ```
+
+**Or using the command with range:**
+
+```vim
+xnoremap <leader>cs :<C-u>execute "CursorAgentSend"<CR>
+```
+
+Note: The Lua keymap is recommended as it ensures the visual selection range is properly captured and passed to the command.
 
 ### Notes
 

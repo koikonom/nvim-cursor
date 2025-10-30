@@ -212,6 +212,19 @@ local function truncate_bytes(s, max_bytes)
   return truncated, omitted
 end
 
+local function build_file_reference(filepath, start_line, end_line)
+  -- Build @file reference, optionally with line range
+  -- filepath: absolute or relative path to file
+  -- start_line, end_line: 1-based line numbers (nil for entire file)
+  local ref = "@" .. filepath
+  if start_line and end_line and start_line ~= end_line then
+    ref = string.format("%s:%d-%d", ref, start_line, end_line)
+  elseif start_line and end_line and start_line == end_line then
+    ref = string.format("%s:%d", ref, start_line)
+  end
+  return ref
+end
+
 local function build_payload(lines, filetype)
   local cfg = get_config()
   local header = cfg.context_header or "[Context from Neovim]"
@@ -271,9 +284,23 @@ function M.send_range(start_line, end_line)
   local l2 = math.max(l1, (end_line or start_line or vim.fn.line(".") ))
   local lines = vim.api.nvim_buf_get_lines(bufnr, l1, l2, true)
   if #lines == 0 then return end
-  local ft = vim.bo[bufnr].filetype
-  local payload = build_payload(lines, ft)
-  send_text(payload)
+  
+  -- Check if buffer is modified and has a file path
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  local is_modified = vim.bo[bufnr].modified
+  
+  if not is_modified and filepath and filepath ~= "" then
+    -- Use @ file reference for unmodified files
+    local start_1based = l1 + 1  -- Convert 0-based to 1-based
+    local end_1based = l2        -- Already 1-based
+    local ref = build_file_reference(filepath, start_1based, end_1based)
+    send_text(ref)
+  else
+    -- Fall back to copying content for modified files or buffers without paths
+    local ft = vim.bo[bufnr].filetype
+    local payload = build_payload(lines, ft)
+    send_text(payload)
+  end
 end
 
 function M.send_visual()
@@ -285,18 +312,44 @@ function M.send_visual()
   local l2 = math.max(l1, end_pos[2])
   local lines = vim.api.nvim_buf_get_lines(bufnr, l1, l2, true)
   if #lines == 0 then return end
-  local ft = vim.bo[bufnr].filetype
-  local payload = build_payload(lines, ft)
-  send_text(payload)
+  
+  -- Check if buffer is modified and has a file path
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  local is_modified = vim.bo[bufnr].modified
+  
+  if not is_modified and filepath and filepath ~= "" then
+    -- Use @ file reference for unmodified files
+    local start_1based = l1 + 1  -- Convert 0-based to 1-based
+    local end_1based = l2        -- Already 1-based
+    local ref = build_file_reference(filepath, start_1based, end_1based)
+    send_text(ref)
+  else
+    -- Fall back to copying content for modified files or buffers without paths
+    local ft = vim.bo[bufnr].filetype
+    local payload = build_payload(lines, ft)
+    send_text(payload)
+  end
 end
 
 function M.send_buffer()
   local bufnr = vim.api.nvim_get_current_buf()
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
   if #lines == 0 then return end
-  local ft = vim.bo[bufnr].filetype
-  local payload = build_payload(lines, ft)
-  send_text(payload)
+  
+  -- Check if buffer is modified and has a file path
+  local filepath = vim.api.nvim_buf_get_name(bufnr)
+  local is_modified = vim.bo[bufnr].modified
+  
+  if not is_modified and filepath and filepath ~= "" then
+    -- Use @ file reference for unmodified files
+    local ref = build_file_reference(filepath)
+    send_text(ref)
+  else
+    -- Fall back to copying content for modified files or buffers without paths
+    local ft = vim.bo[bufnr].filetype
+    local payload = build_payload(lines, ft)
+    send_text(payload)
+  end
 end
 
 function M.setup(user_config)

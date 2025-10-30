@@ -1,3 +1,9 @@
+This was all done as an experiment using cursor. 80/20 rule applies :D 
+
+Anything below this line is done by cursor.
+
+---
+
 ## nvim-cursor-agent
 
 Interactive `cursor-agent` CLI inside Neovim. Open a split next to your code and send selections or the entire buffer as context, then chat interactively in the terminal pane.
@@ -7,10 +13,8 @@ Reference: [Cursor CLI](https://cursor.com/cli)
 ### Install (vim-plug)
 
 ```vim
-Plug 'kyriakos/nvim-cursor'
+Plug 'koikonom/nvim-cursor'
 ```
-
-> If you named the repo differently, adjust the string accordingly.
 
 ### Setup
 
